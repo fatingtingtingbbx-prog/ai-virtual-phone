@@ -1,5 +1,5 @@
 import { callQaAgent, compactQaContext, formatQaErrorMessage, type QaContextEntry } from "./qa-agent-engine";
-import { QA_TOOLS, type QaCreatedContent, type QaProposedCommit } from "./qa-agent-tools";
+import { QA_TOOLS, formatQaToolSubtitle, type QaCreatedContent, type QaProposedCommit } from "./qa-agent-tools";
 import { loadQaGithubConfig } from "./qa-github";
 import { commitQaFiles, revertQaCommit, type QaCommitResult } from "./qa-github-write";
 
@@ -8,13 +8,16 @@ import { commitQaFiles, revertQaCommit, type QaCommitResult } from "./qa-github-
 // 独立 DB，多会话。
 
 const QA_DB_NAME = "AiPhoneQaDB";
-const QA_DB_VERSION = 1;
+// A restore into a fresh browser creates the missing store in DB version 2.
+// Keep the owner at least that high so reopening the restored DB cannot fail
+// with VersionError (opening a lower version than the one on disk).
+const QA_DB_VERSION = 2;
 const QA_STORE = "qa";
 const QA_STATE_KEY = "state";
 const MAX_SESSIONS = 30;
 const MAX_MESSAGES_PER_SESSION = 200;
 
-export type QaToolStatus = { name: string; running: boolean; success?: boolean; detail?: string; result?: string };
+export type QaToolStatus = { name: string; running: boolean; success?: boolean; detail?: string; result?: string; subtitle?: string };
 
 /** 消息内的时序分段：文字与工具行按实际发生顺序交错展示 */
 export type QaSegment =
@@ -54,6 +57,8 @@ export type QaSession = {
     createdAt: number;
     updatedAt: number;
     messages: QaMsg[];
+    /** 抽屉里置顶显示；只影响排序，不动 updatedAt */
+    isPinned?: boolean;
     /** 模型侧完整上下文（含工具调用与结果），跨轮保留；触顶时压缩为摘要 */
     context?: QaContextEntry[];
     /** 本会话中 agent 创建/更新过的本机内容（APP/游戏/剧场），供工坊内预览直接打开 */
@@ -73,7 +78,7 @@ export type QaChatSnapshot = {
 // ── 上下文预算与压缩 ──
 // 预算按字符估算（中文 ≈1 字符/角标 token 量级）。可用 localStorage
 // 键 ai_phone_qa_context_budget_chars 覆盖（调参/测试用）。
-const DEFAULT_CONTEXT_BUDGET_CHARS = 100_000;
+const DEFAULT_CONTEXT_BUDGET_CHARS = 1_000_000;
 
 function getContextBudget(): number {
     try {
@@ -266,6 +271,18 @@ export function getQaChatSnapshot(): QaChatSnapshot {
     return snapshot;
 }
 
+/** 重命名对话：只改标题，不碰 updatedAt——改个名字不该把会话顶到时间序最前 */
+export function renameQaSession(id: string, title: string): void {
+    const trimmed = title.trim().slice(0, 80);
+    if (!trimmed) return;
+    updateSession(id, (s) => ({ ...s, title: trimmed }));
+}
+
+/** 置顶开关：排序在抽屉渲染层做（置顶在前，其余按时间），存储顺序保持时间序 */
+export function toggleQaSessionPin(id: string): void {
+    updateSession(id, (s) => ({ ...s, isPinned: !s.isPinned }));
+}
+
 export async function hydrateQaChat(): Promise<void> {
     if (hydrated) return;
     if (hydratePromise) return hydratePromise;
@@ -355,6 +372,17 @@ export function deleteQaSession(sessionId: string) {
     publish();
 }
 
+/** 编辑一条已发送消息的内容（小坊助手界面"编辑"）。
+ *  只覆盖 content 并清掉时序分段缓存（保证渲染用新内容），工具行/提交卡等历史保留。 */
+export function updateQaMessageContent(sessionId: string, msgId: string, content: string): void {
+    sessions = sessions.map((s) =>
+        s.id !== sessionId
+            ? s
+            : { ...s, messages: s.messages.map((m) => (m.id === msgId ? { ...m, content, segments: undefined } : m)) }
+    );
+    publish();
+}
+
 function updateSession(sessionId: string, updater: (session: QaSession) => QaSession, options?: { persist?: boolean }) {
     sessions = sessions
         .map((s) => (s.id === sessionId ? updater(s) : s))
@@ -418,7 +446,7 @@ export async function sendQaMessage(
 
     const paintAssistant = (patch: Partial<QaMsg>, options?: { persist?: boolean; force?: boolean }) => {
         const now = Date.now();
-        if (!options?.force && streamedContent.length - lastPaintLength < 12 && now - lastPaintAt < 50) return;
+        if (!options?.force && streamedContent.length - lastPaintLength < 64 && now - lastPaintAt < 150) return;
         lastPaintAt = now;
         lastPaintLength = streamedContent.length;
         updateSession(
@@ -433,6 +461,13 @@ export async function sendQaMessage(
     };
 
     const toolLabel = (name: string): string => QA_TOOLS.find((t) => t.name === name)?.name ?? name;
+
+    // 工具行的参数/结果只存 UI 需要的头部：完整内容只属于模型上下文，
+    // 90k 级的读取结果整条进渲染与持久层会把低端机拖垮
+    const clipForUi = (text: string | undefined): string | undefined => {
+        if (text == null) return undefined;
+        return text.length > 4000 ? `${text.slice(0, 4000)}\n…（已截断，完整内容共 ${text.length.toLocaleString()} 字符）` : text;
+    };
 
     try {
         const history = (getActiveSession()?.messages ?? [])
@@ -468,8 +503,21 @@ export async function sendQaMessage(
                     paintAssistant({ reasoning: streamedReasoning }, { persist: false });
                 },
                 onToolStart: (name, args) => {
-                    const detail = args && Object.keys(args).length > 0 ? JSON.stringify(args, null, 2) : undefined;
-                    const status: QaToolStatus = { name: toolLabel(name), running: true, detail };
+                    const detail = args && Object.keys(args).length > 0 ? clipForUi(JSON.stringify(args, null, 2)) : undefined;
+                    const subtitle = formatQaToolSubtitle(name, args) || undefined;
+                    const status: QaToolStatus = { name: toolLabel(name), running: true, detail, subtitle };
+                    toolStatuses = [...toolStatuses, status];
+                    segments = [...segments, { kind: "tool", tool: status }];
+                    paintAssistant({ tools: toolStatuses, segments }, { force: true, persist: false });
+                },
+                // 引擎静默续接时给用户一行可见说明——否则模型突然谈"被截断"显得没头没脑
+                onAutoContinue: (reason) => {
+                    const status: QaToolStatus = {
+                        name: "自动续写",
+                        running: false,
+                        success: true,
+                        subtitle: reason === "truncated" ? "输出到达单次上限被截断，已自动接力" : "分段未完，自动继续",
+                    };
                     toolStatuses = [...toolStatuses, status];
                     segments = [...segments, { kind: "tool", tool: status }];
                     paintAssistant({ tools: toolStatuses, segments }, { force: true, persist: false });
@@ -479,7 +527,7 @@ export async function sendQaMessage(
                     const done: QaToolStatus[] = [];
                     toolStatuses = toolStatuses.map((t) =>
                         !patched && t.running && t.name === toolLabel(name)
-                            ? ((patched = true), done[0] = { ...t, running: false, success, result }, done[0])
+                            ? ((patched = true), done[0] = { ...t, running: false, success, result: clipForUi(result) }, done[0])
                             : t,
                     );
                     if (done[0]) {

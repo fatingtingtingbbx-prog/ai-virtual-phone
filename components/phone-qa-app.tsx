@@ -1,12 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
-import { AppWindow, ArrowUp, BrushCleaning, Check, ChevronLeft, ChevronRight, Copy, Drama, Gamepad2, Github, Loader2, Menu, Play, Plus, Square, Trash2, Wrench, X } from "lucide-react";
+import { AppWindow, ArrowUp, BrushCleaning, Check, ChevronLeft, ChevronRight, Copy, Drama, Gamepad2, Github, Loader2, Menu, MoreVertical, Pencil, Pin, PinOff, Play, Plus, Square, Trash2, Wrench, X } from "lucide-react";
+import { QaFileCard } from "@/components/qa-file-card";
+import { parseQaFileMarker } from "@/lib/qa-computer-tools";
 import { mdiHammerWrench } from "@mdi/js";
 import { CustomAppRunner } from "@/components/app-market/custom-app-runner";
+import { CustomAppForegroundBoundary } from "@/components/app-market/custom-app-failure";
 import { GameHubApp } from "@/components/game/game-hub-app";
 import { BlackMarketApp } from "@/components/shopping/black-market-app";
 import { getInstalledCustomApp } from "@/lib/custom-app-storage";
@@ -27,11 +30,14 @@ import {
   QA_DEFAULT_CONTEXT_BUDGET_CHARS,
   setQaContextBudgetChars,
   retryQaMessage,
+  renameQaSession,
   revertQaAppliedCommit,
   sendQaMessage,
   stopQaGeneration,
   subscribeQaChat,
   switchQaSession,
+  toggleQaSessionPin,
+  updateQaMessageContent,
   type QaMsg,
   type QaSession,
   type QaToolStatus,
@@ -47,6 +53,11 @@ import {
   QA_DEFAULT_MAX_ROUNDS,
   QA_MAX_ROUNDS_MIN,
   QA_MAX_ROUNDS_MAX,
+  getQaMaxOutputTokens,
+  setQaMaxOutputTokens,
+  QA_DEFAULT_MAX_OUTPUT_TOKENS,
+  QA_MAX_OUTPUT_TOKENS_MIN,
+  QA_MAX_OUTPUT_TOKENS_MAX,
 } from "@/lib/qa-prefs";
 import { resolveQaApiConfig } from "@/lib/qa-agent-engine";
 import {
@@ -206,7 +217,9 @@ function QaCommitCard({ msg }: { msg: QaMsg }) {
 // 工具调用行：折叠的单行摘要，点开展开参数与结果（Claude Code 风格）
 function QaToolRow({ tool }: { tool: QaToolStatus }) {
   const [open, setOpen] = useState(false);
-  const hasDetail = Boolean(tool.detail || tool.result);
+  // 「电脑文件 op=send」的结果里带文件卡标记：卡片常显，标记从结果文本中剥离
+  const { text: resultText, file } = parseQaFileMarker(tool.result || "");
+  const hasDetail = Boolean(tool.detail || resultText);
   const summary = tool.running ? `正在${tool.name}…` : tool.success === false ? `${tool.name}失败` : tool.name;
   return (
     <div className={`qa-tool-row ${tool.running ? "is-running" : tool.success === false ? "is-fail" : "is-done"}`}>
@@ -217,7 +230,10 @@ function QaToolRow({ tool }: { tool: QaToolStatus }) {
         disabled={!hasDetail}
       >
         {tool.running ? <Loader2 size={13} className="qa-spin" /> : <Wrench size={13} />}
-        <span className="qa-tool-row-summary">{summary}</span>
+        <span className="qa-tool-row-summary">
+          {summary}
+          {tool.subtitle && <span className="qa-tool-row-sub">{tool.subtitle}</span>}
+        </span>
         {hasDetail && <ChevronRight size={14} className={`qa-tool-row-chevron ${open ? "is-open" : ""}`} />}
       </button>
       {open && hasDetail && (
@@ -228,41 +244,78 @@ function QaToolRow({ tool }: { tool: QaToolStatus }) {
               <pre className="qa-tool-row-pre">{tool.detail}</pre>
             </>
           )}
-          {tool.result && (
+          {resultText && (
             <>
               <div className="qa-tool-row-label">结果</div>
-              <pre className="qa-tool-row-pre">{tool.result}</pre>
+              <pre className="qa-tool-row-pre">{resultText}</pre>
             </>
           )}
         </div>
       )}
+      {file && <QaFileCard file={file} />}
     </div>
   );
 }
 
-function QaMessageItem({ msg, isStreaming, onRetry, onViewImage }: { msg: QaMsg; isStreaming: boolean; onRetry: (id: string) => void; onViewImage: (url: string) => void }) {
-  if (msg.role === "user") {
-    return (
-      <div className="qa-msg-user-row">
-        <div className="qa-msg-user">
-          {msg.images && msg.images.length > 0 && (
-            <div className="qa-msg-images">
-              {msg.images.map((url, i) => (
-                <button key={i} type="button" className="qa-msg-image" onClick={() => onViewImage(url)} aria-label="查看图片">
-                  <img src={url} alt="" />
-                </button>
-              ))}
-            </div>
-          )}
-          {msg.content}
-        </div>
-      </div>
-    );
-  }
+// 已完成文本的 Markdown 渲染：memo 缓存——流式期间每次增量都全文重排 remark 是
+// 低端机 WebView OOM 崩溃的主因（几万字 × 每秒多次解析）。文本不变就不重渲。
+const QaMarkdownBlock = memo(function QaMarkdownBlock({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={QA_MARKDOWN_COMPONENTS}>
+      {text}
+    </ReactMarkdown>
+  );
+});
 
+// 正在生长的活跃段：纯文本渲染（零解析成本），生成结束后换回完整 Markdown
+function QaStreamingText({ text }: { text: string }) {
+  return (
+    <>
+      <div className="qa-stream-text">{text}</div>
+      <span className="qa-cursor" />
+    </>
+  );
+}
+
+const QaMessageItem = memo(function QaMessageItem({
+  msg,
+  isStreaming,
+  onRetry,
+  onViewImage,
+  onCopy,
+  onEdit,
+}: {
+  msg: QaMsg;
+  isStreaming: boolean;
+  onRetry: (id: string) => void;
+  onViewImage: (url: string) => void;
+  onCopy: (content: string) => void;
+  onEdit: (msg: QaMsg) => void;
+}) {
   const thinkingOnly = isStreaming && !msg.content && (!msg.tools || msg.tools.length === 0);
+  // 消息操作（复制原始内容 / 编辑原始内容——前端渲染会吞掉一些特殊标签，
+  // 沟通时看不到原文）常驻在气泡下方，不用长按触发：长按要跟系统的选词、
+  // 取词、划词搜索抢同一个手势，在移动端几乎必然打架。
+  // 生成中不显示（内容还不完整，复制/编辑都没有意义）。
+  const showActions = !isStreaming && !thinkingOnly;
+  const msgWrap = (node: ReactNode) => (
+    <div className="qa-msg-wrap">
+      {node}
+      {showActions && (
+        <div className="qa-msg-actions" data-role={msg.role}>
+          <button type="button" className="qa-msg-action" aria-label="复制原始内容" title="复制" onClick={() => onCopy(msg.content)}>
+            <Copy size={14} strokeWidth={2} />
+          </button>
+          <button type="button" className="qa-msg-action" aria-label="编辑原始内容" title="编辑" onClick={() => onEdit(msg)}>
+            <Pencil size={14} strokeWidth={2} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
   // 时序分段渲染：文字与工具行按实际发生顺序交错（连续工具行合并成一组）；
-  // 旧消息没有 segments 时回退「工具在顶、文字在下」布局
+  // 旧消息没有 segments 时回退「工具在顶、文字在下」布局。
+  // hooks 必须在 user 分支 early-return 之前调用（rules-of-hooks）
   const segmentBlocks = useMemo(() => {
     if (!msg.segments?.length) return null;
     const blocks: Array<{ kind: "text"; text: string } | { kind: "tools"; tools: QaToolStatus[] }> = [];
@@ -279,7 +332,26 @@ function QaMessageItem({ msg, isStreaming, onRetry, onViewImage }: { msg: QaMsg;
     return blocks.length ? blocks : null;
   }, [msg.segments]);
 
-  return (
+  if (msg.role === "user") {
+    return msgWrap(
+      <div className="qa-msg-user-row">
+        <div className="qa-msg-user">
+          {msg.images && msg.images.length > 0 && (
+            <div className="qa-msg-images">
+              {msg.images.map((url, i) => (
+                <button key={i} type="button" className="qa-msg-image" onClick={() => onViewImage(url)} aria-label="查看图片">
+                  <img src={url} alt="" />
+                </button>
+              ))}
+            </div>
+          )}
+          {msg.content}
+        </div>
+      </div>,
+    );
+  }
+
+  return msgWrap(
     <div className="qa-msg-assistant">
       {segmentBlocks ? (
         segmentBlocks.map((block, i) =>
@@ -289,12 +361,13 @@ function QaMessageItem({ msg, isStreaming, onRetry, onViewImage }: { msg: QaMsg;
                 <QaToolRow key={`${tool.name}-${j}`} tool={tool} />
               ))}
             </div>
+          ) : isStreaming && i === segmentBlocks.length - 1 ? (
+            <div className="qa-markdown" key={i}>
+              <QaStreamingText text={block.text} />
+            </div>
           ) : (
             <div className="qa-markdown" key={i}>
-              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={QA_MARKDOWN_COMPONENTS}>
-                {block.text}
-              </ReactMarkdown>
-              {isStreaming && i === segmentBlocks.length - 1 && <span className="qa-cursor" />}
+              <QaMarkdownBlock text={block.text} />
             </div>
           ),
         )
@@ -309,12 +382,13 @@ function QaMessageItem({ msg, isStreaming, onRetry, onViewImage }: { msg: QaMsg;
           )}
           {thinkingOnly ? (
             <div className="qa-thinking">{msg.toolDrafting ? "正在编写工具调用…" : msg.reasoning ? "正在思考…" : "正在生成…"}</div>
+          ) : isStreaming ? (
+            <div className="qa-markdown">
+              <QaStreamingText text={msg.content} />
+            </div>
           ) : (
             <div className="qa-markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={QA_MARKDOWN_COMPONENTS}>
-                {msg.content}
-              </ReactMarkdown>
-              {isStreaming && <span className="qa-cursor" />}
+              <QaMarkdownBlock text={msg.content} />
             </div>
           )}
         </>
@@ -333,9 +407,9 @@ function QaMessageItem({ msg, isStreaming, onRetry, onViewImage }: { msg: QaMsg;
           </button>
         </div>
       )}
-    </div>
+    </div>,
   );
-}
+});
 
 // ── 会话抽屉 ─────────────────────────────────────────
 
@@ -346,6 +420,7 @@ function QaSessionDrawer({
   onDelete,
   onCreate,
   onOpenSettings,
+  onRenameRequest,
 }: {
   sessions: QaSession[];
   activeId: string | null;
@@ -353,35 +428,95 @@ function QaSessionDrawer({
   onDelete: (id: string) => void;
   onCreate: () => void;
   onOpenSettings: () => void;
+  onRenameRequest: (id: string, title: string) => void;
 }) {
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+
+  // 置顶的排最前，其余保持时间序。只在渲染层排，存储顺序不动
+  const sortedSessions = useMemo(() => {
+    return [...sessions].sort((a, b) => {
+      if (Boolean(a.isPinned) !== Boolean(b.isPinned)) return a.isPinned ? -1 : 1;
+      return b.updatedAt - a.updatedAt;
+    });
+  }, [sessions]);
+
   return (
     <aside className="qa-drawer">
       <div className="qa-drawer-head">
         <span className="qa-drawer-title">对话记录</span>
       </div>
-      <div className="qa-drawer-list hide-scrollbar">
-        {sessions.length === 0 && <div className="qa-drawer-empty">还没有对话</div>}
-        {sessions.map((session) => (
+      <div
+        className="qa-drawer-list hide-scrollbar"
+        onClick={() => { if (menuOpenId) setMenuOpenId(null); }}
+      >
+        {sortedSessions.length === 0 && <div className="qa-drawer-empty">还没有对话</div>}
+        {sortedSessions.map((session) => (
           <div
             key={session.id}
             className={`qa-drawer-item ${session.id === activeId ? "is-active" : ""}`}
             onClick={() => onSelect(session.id)}
           >
             <div className="qa-drawer-item-main">
-              <span className="qa-drawer-item-title">{session.title}</span>
+              <span className="qa-drawer-item-title">
+                {session.isPinned && <Pin size={12} className="qa-drawer-pin-mark" aria-label="已置顶" />}
+                {session.title}
+              </span>
               <span className="qa-drawer-item-time">{formatRelativeTime(session.updatedAt)}</span>
             </div>
             <button
               type="button"
-              className="qa-icon-btn qa-drawer-item-delete"
-              aria-label="删除对话"
+              className="qa-icon-btn qa-drawer-item-more"
+              aria-label="更多操作"
+              aria-expanded={menuOpenId === session.id}
               onClick={(e) => {
                 e.stopPropagation();
-                onDelete(session.id);
+                setMenuOpenId(menuOpenId === session.id ? null : session.id);
               }}
             >
-              <Trash2 size={14} />
+              <MoreVertical size={14} />
             </button>
+
+            {menuOpenId === session.id && (
+              <div className="qa-drawer-item-menu" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="qa-drawer-menu-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleQaSessionPin(session.id);
+                    setMenuOpenId(null);
+                  }}
+                >
+                  {session.isPinned ? <PinOff size={14} /> : <Pin size={14} />}
+                  {session.isPinned ? "取消置顶" : "置顶"}
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="qa-drawer-menu-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRenameRequest(session.id, session.title);
+                    setMenuOpenId(null);
+                  }}
+                >
+                  <Pencil size={14} /> 重命名
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="qa-drawer-menu-btn is-danger"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(session.id);
+                    setMenuOpenId(null);
+                  }}
+                >
+                  <Trash2 size={14} /> 删除
+                </button>
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -405,6 +540,10 @@ function QaSettingsSheet({ onClose, onNotice }: { onClose: () => void; onNotice?
   const [budget, setBudget] = useState(() => String(getQaContextBudgetChars()));
   const [pageChars, setPageChars] = useState(() => String(getQaPageChars()));
   const [maxRounds, setMaxRounds] = useState(() => String(getQaMaxRounds()));
+  const [maxOutTokens, setMaxOutTokens] = useState(() => {
+    const v = getQaMaxOutputTokens();
+    return v == null ? "" : String(v);
+  });
   const usedChars = getQaActiveContextChars();
   const pct = Math.round((usedChars / getQaContextBudgetChars()) * 100);
 
@@ -424,9 +563,17 @@ function QaSettingsSheet({ onClose, onNotice }: { onClose: () => void; onNotice?
       onNotice?.(`工具调用上限需为 ${QA_MAX_ROUNDS_MIN} - ${QA_MAX_ROUNDS_MAX} 之间的数字。`);
       return;
     }
+    const trimmedTokens = maxOutTokens.trim();
+    const parsedTokens = trimmedTokens ? Number(trimmedTokens) : null;
+    if (parsedTokens != null && (!Number.isFinite(parsedTokens) || parsedTokens < QA_MAX_OUTPUT_TOKENS_MIN || parsedTokens > QA_MAX_OUTPUT_TOKENS_MAX)) {
+      onNotice?.(`单次最大输出 token 需留空或为 ${QA_MAX_OUTPUT_TOKENS_MIN.toLocaleString()} - ${QA_MAX_OUTPUT_TOKENS_MAX.toLocaleString()} 之间的数字。`);
+      return;
+    }
     setQaContextBudgetChars(parsed);
     setQaPageChars(parsedPage);
     setQaMaxRounds(parsedRounds);
+    // 留空 = 显式不传 max_tokens（0 哨兵），与"没设置用默认值"区分开
+    setQaMaxOutputTokens(trimmedTokens ? parsedTokens : 0);
     onNotice?.("已保存工坊配置。");
     onClose();
   };
@@ -435,9 +582,11 @@ function QaSettingsSheet({ onClose, onNotice }: { onClose: () => void; onNotice?
     setQaContextBudgetChars(null);
     setQaPageChars(null);
     setQaMaxRounds(null);
+    setQaMaxOutputTokens(null);
     setBudget(String(QA_DEFAULT_CONTEXT_BUDGET_CHARS));
     setPageChars(String(QA_DEFAULT_PAGE_CHARS));
     setMaxRounds(String(QA_DEFAULT_MAX_ROUNDS));
+    setMaxOutTokens(String(QA_DEFAULT_MAX_OUTPUT_TOKENS));
     onNotice?.("已恢复默认配置。");
   };
 
@@ -490,6 +639,22 @@ function QaSettingsSheet({ onClose, onNotice }: { onClose: () => void; onNotice?
         </label>
         <div className="qa-settings-hint">
           一次提问里小坊最多连续执行多少轮工具，用完会提示「回复继续」。默认 {QA_DEFAULT_MAX_ROUNDS}；复杂任务（写游戏、改代码）可调大，想控制 token 消耗可调小。
+        </div>
+        <label className="qa-settings-field">
+          <span>单次最大输出 token</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min={QA_MAX_OUTPUT_TOKENS_MIN}
+            max={QA_MAX_OUTPUT_TOKENS_MAX}
+            step={1000}
+            placeholder="留空 = 不传"
+            value={maxOutTokens}
+            onChange={(e) => setMaxOutTokens(e.target.value)}
+          />
+        </label>
+        <div className="qa-settings-hint">
+          输出长度护栏：每次请求带 max_tokens，小坊会按该预算分段写大文件，写超被安全截断后自动续接，不再整轮报废。默认 {QA_DEFAULT_MAX_OUTPUT_TOKENS.toLocaleString()}；留空 = 不传该参数（部分模型/中转不支持 max_tokens 时请留空）。
         </div>
         <div className="qa-devnotice-actions is-row">
           <button type="button" className="qa-devnotice-btn" onClick={reset}>恢复默认</button>
@@ -576,7 +741,7 @@ function QaRepoSheet({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
             <span className="qa-field-label">Fine-grained PAT（私有仓库或搜索代码需要）</span>
             <input className="qa-input" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="github_pat_…" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
             <span className="qa-field-hint">
-              GitHub → Settings → Menu 按钮 → Developer settings → Personal access tokens → Fine-grained tokens。创建时 Repository access 记得勾选目标仓库；Permissions 只需添加 Contents 一项——只查代码选 Read-only，要让工坊改代码选 Read and write（Metadata 会自动带上，其余权限都不用勾）。
+              GitHub → Settings → Menu 按钮 → Developer settings → Personal access tokens → Fine-grained tokens。创建时 Repository access 记得勾选目标仓库；Permissions 里：Contents——只查代码选 Read-only，要让工坊改代码选 Read and write；要用「创建PR」再加 Pull requests 的 Read and write（Metadata 会自动带上，其余权限都不用勾）。
             </span>
           </label>
           <div className="qa-field">
@@ -631,8 +796,13 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
   const [repoConnected, setRepoConnected] = useState(false);
   const [clearToolsOpen, setClearToolsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  /** 会话重命名弹窗：抽屉菜单里点「重命名」打开 */
+  const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null);
+  const [renameTitle, setRenameTitle] = useState("");
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const [viewerImage, setViewerImage] = useState<string | null>(null);
+  const [editingMsg, setEditingMsg] = useState<QaMsg | null>(null);
+  const [editText, setEditText] = useState("");
   const [visionEnabled, setVisionEnabled] = useState(false);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const [apiReady, setApiReady] = useState(true);
@@ -755,6 +925,25 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
     void retryQaMessage(assistantMsgId);
   }, []);
 
+  const handleCopyMessage = useCallback((content: string) => {
+    void navigator.clipboard?.writeText(content).then(
+      () => onNotice?.("已复制原始内容"),
+      () => onNotice?.("复制失败"),
+    );
+  }, [onNotice]);
+
+  const handleEditMessage = useCallback((msg: QaMsg) => {
+    setEditingMsg(msg);
+    setEditText(msg.content);
+  }, []);
+
+  const handleSaveEdit = useCallback(() => {
+    if (!editingMsg || !snapshot.activeSessionId) return;
+    updateQaMessageContent(snapshot.activeSessionId, editingMsg.id, editText);
+    setEditingMsg(null);
+    onNotice?.("已保存消息内容");
+  }, [editingMsg, editText, snapshot.activeSessionId, onNotice]);
+
   const streamingMsgId =
     snapshot.isGenerating && messages.length > 0 && messages[messages.length - 1].role === "assistant"
       ? messages[messages.length - 1].id
@@ -777,6 +966,10 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
         onOpenSettings={() => {
           setSettingsOpen(true);
           setDrawerOpen(false);
+        }}
+        onRenameRequest={(id, title) => {
+          setRenameTarget({ id, title });
+          setRenameTitle(title);
         }}
       />
       <div className={`qa-stage ${drawerOpen ? "is-pushed" : ""}`}>
@@ -845,7 +1038,7 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
         ) : (
           <div className="qa-messages">
             {messages.map((msg) => (
-              <QaMessageItem key={msg.id} msg={msg} isStreaming={msg.id === streamingMsgId} onRetry={handleRetry} onViewImage={setViewerImage} />
+              <QaMessageItem key={msg.id} msg={msg} isStreaming={msg.id === streamingMsgId} onRetry={handleRetry} onViewImage={setViewerImage} onCopy={handleCopyMessage} onEdit={handleEditMessage} />
             ))}
           </div>
         )}
@@ -974,6 +1167,40 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
       )}
       </div>
 
+      {renameTarget && (
+        <div className="qa-rename-backdrop" role="presentation" onClick={() => setRenameTarget(null)}>
+          <form
+            className="qa-rename-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="qa-rename-dialog-title"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const title = renameTitle.trim();
+              if (!title) return;
+              renameQaSession(renameTarget.id, title);
+              setRenameTarget(null);
+            }}
+          >
+            <div id="qa-rename-dialog-title" className="qa-rename-title">重命名对话</div>
+            <input
+              className="qa-rename-input"
+              autoFocus
+              value={renameTitle}
+              maxLength={80}
+              aria-label="新对话名称"
+              onChange={(e) => setRenameTitle(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Escape") setRenameTarget(null); }}
+            />
+            <div className="qa-rename-actions">
+              <button type="button" className="qa-rename-cancel" onClick={() => setRenameTarget(null)}>取消</button>
+              <button type="submit" className="qa-drawer-new qa-rename-confirm" disabled={!renameTitle.trim()}>确认</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {clearToolsOpen && (
         <div className="qa-devnotice-backdrop" onClick={() => setClearToolsOpen(false)}>
           <div className="qa-devnotice" role="alertdialog" aria-label="清理工具历史确认" onClick={(e) => e.stopPropagation()}>
@@ -999,6 +1226,35 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
           <button type="button" className="qa-image-viewer-close" aria-label="关闭" onClick={() => setViewerImage(null)}>
             <X size={20} />
           </button>
+        </div>
+      )}
+
+      {editingMsg && (
+        <div className="qa-edit-backdrop" onClick={() => setEditingMsg(null)}>
+          <div className="qa-edit-dialog" role="dialog" aria-label="编辑消息" onClick={(e) => e.stopPropagation()}>
+            <div className="qa-edit-head">
+              <span className="qa-edit-title">编辑消息（未渲染原始内容）</span>
+              <button type="button" className="qa-icon-btn" onClick={() => setEditingMsg(null)} aria-label="关闭">
+                <X size={16} />
+              </button>
+            </div>
+            <textarea
+              className="qa-edit-textarea"
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              spellCheck={false}
+              autoFocus
+              placeholder="这里显示的是消息的原始内容，不会被前端渲染，可放心查看特殊标签。"
+            />
+            <div className="qa-edit-actions">
+              <button type="button" className="qa-devnotice-btn" onClick={() => setEditingMsg(null)}>
+                取消
+              </button>
+              <button type="button" className="qa-devnotice-btn is-primary" onClick={handleSaveEdit}>
+                保存
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1047,7 +1303,17 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
         <div className="qa-preview-runtime">
           {previewItem.type === "app" ? (
             previewApp ? (
-              <CustomAppRunner app={previewApp} onClose={() => setPreviewItem(null)} />
+              <CustomAppForegroundBoundary
+                key={previewApp.id}
+                appName={previewApp.name}
+                appId={previewApp.id}
+                appVersion={previewApp.version}
+                manifestId={previewApp.manifest?.id}
+                closeLabel="返回"
+                onClose={() => setPreviewItem(null)}
+              >
+                <CustomAppRunner app={previewApp} onClose={() => setPreviewItem(null)} />
+              </CustomAppForegroundBoundary>
             ) : (
               <div className="qa-preview-missing">
                 <p>这个应用已被卸载或找不到了。</p>
